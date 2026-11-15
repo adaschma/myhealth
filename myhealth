@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""
+Show the time spent cycling over the last N days (default: 7) from Garmin Connect.
+
+Installation:
+    pip install garminconnect
+
+Credentials via environment variables:
+    export GARMIN_EMAIL="you@example.com"
+    export GARMIN_PASSWORD="your-password"
+
+or from the 'pass' password manager (--pass ENTRY).
+
+After the first login the tokens are stored in $XDG_DATA_HOME/garminconnect
+(default: ~/.local/share/garminconnect), so that a new login (and possibly
+MFA) is not required on every run. Set GARMINTOKENS to use a different path.
+
+Note: The 'garminconnect' library uses the unofficial Garmin Connect
+interface. The official Garmin Health/Activity API is only available to
+approved developer partners.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from datetime import date, timedelta
+from pathlib import Path
+
+from garminconnect import (
+    Garmin,
+    GarminConnectAuthenticationError,
+    GarminConnectConnectionError,
+    GarminConnectTooManyRequestsError,
+)
+
+
+def _tokenstore() -> Path:
+    """
+    Token directory following the XDG Base Directory Specification:
+    $GARMINTOKENS, otherwise $XDG_DATA_HOME/garminconnect
+    (default: ~/.local/share/garminconnect).
+    """
+    if os.getenv("GARMINTOKENS"):
+        return Path(os.environ["GARMINTOKENS"]).expanduser()
+
+    data_home = os.getenv("XDG_DATA_HOME")
+    base = (
+        Path(data_home)
+        if data_home and Path(data_home).is_absolute()
+        else Path.home() / ".local" / "share"
+    )
+    return base / "garminconnect"
+
+
+TOKENSTORE = _tokenstore()
+
+# Garmin activity types that count as cycling
+CYCLING_TYPES = {
+    "cycling",
+    "road_biking",
+    "mountain_biking",
+    "gravel_cycling",
+    "indoor_cycling",
+    "virtual_ride",
+    "e_bike_fitness",
+    "e_bike_mountain",
+    "bmx",
+    "cyclocross",
+    "track_cycling",
+}
+
+EMAIL_FIELDS = ("email", "e-mail", "user", "username", "login")
+
+
+def credentials_from_pass(entry: str) -> tuple[str | None, str]:
+    """
+    Read credentials from 'pass' (https://www.passwordstore.org/).
+
+    Expected entry format:
+        <password>
+        email: you@example.com      (also user:/username:/login:)
+
+    The first line is the password. If there is no email line, GARMIN_EMAIL
+    from the environment is used.
+    """
+    try:
+        result = subprocess.run(
+            ["pass", "show", entry],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except FileNotFoundError:
+        sys.exit("'pass' not found - is it installed?")
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"pass show {entry} failed: {e.stderr.strip()}")
+
+    lines = result.stdout.splitlines()
+    if not lines or not lines[0].strip():
+        sys.exit(f"The pass entry '{entry}' is empty.")
+
+    password = lines[0].strip()
+    email = None
+    for line in lines[1:]:
+        key, _, value = line.partition(":")
+        if key.strip().lower() in EMAIL_FIELDS and value.strip():
+            email = value.strip()
+            break
+    return email, password
+
+
+def login(pass_entry: str | None = None) -> Garmin:
+    """Log in with a saved token, otherwise with email/password."""
+    try:
+        client = Garmin()
+        client.login(str(TOKENSTORE))
+        return client
+    except Exception:
+        pass  # no/invalid token -> regular login
+
+    if pass_entry:
+        email, password = credentials_from_pass(pass_entry)
+        email = email or os.getenv("GARMIN_EMAIL")
+        if not email:
+            sys.exit(
+                f"No email in pass entry '{pass_entry}' "
+                "(line 'email: ...') and GARMIN_EMAIL is not set."
+            )
+    else:
+        email = os.getenv("GARMIN_EMAIL")
+        password = os.getenv("GARMIN_PASSWORD")
+        if not email or not password:
+            sys.exit(
+                "Please set GARMIN_EMAIL and GARMIN_PASSWORD "
+                "or use --pass ENTRY."
+            )
+
+    client = Garmin(email, password, prompt_mfa=lambda: input("MFA code: "))
+    client.login()
+    TOKENSTORE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        client.garth.dump(str(TOKENSTORE))
+    except Exception:
+        pass  # saving the token is optional
+    return client
+
+
+def fmt(seconds: float) -> str:
+    s = int(round(seconds))
+    return f"{s // 3600}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+
+
+def positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return number
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Time spent cycling over the last days, from Garmin Connect."
+    )
+    parser.add_argument(
+        "--days",
+        type=positive_int,
+        default=7,
+        metavar="N",
+        help="number of days to look back (default: 7)",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="output JSON instead of text",
+    )
+    parser.add_argument(
+        "--pass",
+        dest="pass_entry",
+        metavar="ENTRY",
+        help="read credentials from 'pass', e.g. --pass garmin/connect",
+    )
+    args = parser.parse_args()
+
+    today = date.today()
+    start = today - timedelta(days=args.days)
+
+    try:
+        client = login(args.pass_entry)
+        activities = client.get_activities_by_date(
+            start.isoformat(), today.isoformat()
+        )
+    except GarminConnectAuthenticationError:
+        sys.exit("Authentication failed - please check your credentials.")
+    except GarminConnectTooManyRequestsError:
+        sys.exit("Too many requests - please try again later.")
+    except GarminConnectConnectionError as e:
+        sys.exit(f"Connection error: {e}")
+
+    rides = [
+        a
+        for a in activities
+        if a.get("activityType", {}).get("typeKey") in CYCLING_TYPES
+    ]
+
+    total_moving = 0.0
+    total_duration = 0.0
+    total_km = 0.0
+    entries = []
+
+    for a in sorted(rides, key=lambda x: x["startTimeLocal"]):
+        moving = a.get("movingDuration") or a.get("duration") or 0
+        duration = a.get("duration") or 0
+        km = (a.get("distance") or 0) / 1000
+        total_moving += moving
+        total_duration += duration
+        total_km += km
+        entries.append(
+            {
+                "id": a.get("activityId"),
+                "name": a.get("activityName"),
+                "type": a.get("activityType", {}).get("typeKey"),
+                "start": a["startTimeLocal"],
+                "moving_seconds": round(moving),
+                "duration_seconds": round(duration),
+                "distance_km": round(km, 2),
+            }
+        )
+
+    if args.json:
+        output = {
+            "days": args.days,
+            "from": start.isoformat(),
+            "to": today.isoformat(),
+            "activity_count": len(entries),
+            "total_moving_seconds": round(total_moving),
+            "total_moving_hours": round(total_moving / 3600, 2),
+            "total_duration_seconds": round(total_duration),
+            "total_duration_hours": round(total_duration / 3600, 2),
+            "total_distance_km": round(total_km, 1),
+            "activities": entries,
+        }
+        print(json.dumps(output, indent=2, ensure_ascii=False))
+        return
+
+    print(f"Cycling {start:%Y-%m-%d} - {today:%Y-%m-%d}\n")
+    for e in entries:
+        print(
+            f"{e['start'][:16]}  "
+            f"{(e['name'] or '')[:28]:<28}  "
+            f"{fmt(e['moving_seconds'])}  {e['distance_km']:6.1f} km"
+        )
+
+    print("-" * 62)
+    print(f"Activities:           {len(rides)}")
+    print(f"Moving time:          {fmt(total_moving)}  ({total_moving / 3600:.2f} h)")
+    print(f"Total duration:       {fmt(total_duration)}  ({total_duration / 3600:.2f} h)")
+    print(f"Distance:             {total_km:.1f} km")
+
+
+if __name__ == "__main__":
+    main()
